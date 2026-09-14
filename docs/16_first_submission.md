@@ -176,26 +176,58 @@ The kernel side behavior was confirmed against the driver source in
 mali-kbase-src, also under the GPL and published by Arm. The source
 was read for behavior, not copied.
 
+## Extension: tiler heap in use
+
+After the first successful submission, the heap path was wired up.
+This required one additional discovery that the UAPI headers do not
+make obvious.
+
+### The CUSTOM_VA zone is initialized by MEM_JIT_INIT
+
+The tiler heap context is allocated by the kernel in the CUSTOM_VA
+GPU memory zone. That zone has size zero until the process calls
+KBASE_IOCTL_MEM_JIT_INIT. Without that call any allocation that
+lands in CUSTOM_VA fails with ENOMEM, and the failure is reported
+by CS_TILER_HEAP_INIT as a bare ENOMEM without any indication of
+the real cause.
+
+The fix is to call MEM_JIT_INIT during device open, right after
+MEM_EXEC_INIT. Both calls are cheap and their sizes are small.
+
+This is not documented in the Kbase UAPI headers. It was found by
+reading the kernel side implementation in
+mali_kbase/csf/mali_kbase_csf_heap_context_alloc.c, where the
+CUSTOM_VA region is set up only inside the JIT initialization path.
+
+### mprobe now exercises the heap
+
+The probe tool has been extended. It creates a tiler heap with the
+default parameters (1 MiB chunks, 4 initial, 200 max, 8 render
+passes in flight), submits a batch that emits HEAP_SET and
+HEAP_OPERATION (VERTEX_TILER_STARTED) through the ring, waits for
+the sync to confirm the batch retired, and then runs two more
+submissions to verify monotonic sync values.
+
+The whole sequence, from open to close, completes in about 11
+milliseconds. Individual sync waits take between 100 microseconds
+and about 1 millisecond depending on how quickly the firmware
+processes the batch.
+
 ## What comes next
 
 The immediate next steps in order of priority:
 
-1. Tiler heap in actual use. The heap module is implemented and
-   tested in isolation, but no submission has yet emitted HEAP_SET
-   and used the heap. This is the first step towards a graphics
-   pipeline.
-
-2. A compute shader. The command set already supports CALL and the
+1. A compute shader. The command set already supports CALL and the
    command builder exposes it. With a precompiled ISA Valhall shader
    and a small descriptor buffer, Manvil can issue a compute
    dispatch and read the result back through a sync.
 
-3. KRAID integration. The Mesa KRAID compiler produces ISA Valhall
+2. KRAID integration. The Mesa KRAID compiler produces ISA Valhall
    from SPIR-V. Manvil can use it as a library to compile arbitrary
    shaders at pipeline creation time. This removes the need to ship
    precompiled shaders for every workload.
 
-4. Vulkan ICD. Once the submission path can carry a real pipeline,
+3. Vulkan ICD. Once the submission path can carry a real pipeline,
    the Vulkan ICD layer can be built on top.
 
 ## Reproducing the result
