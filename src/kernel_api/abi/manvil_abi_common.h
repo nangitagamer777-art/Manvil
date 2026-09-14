@@ -273,6 +273,25 @@ struct manvil_kbase_ioctl_mem_free {
     uint64_t gpu_addr;
 };
 
+/*
+ * Memory query.
+ *
+ * The gpu_addr is a value previously returned by MEM_ALLOC. The query
+ * field selects what to return:
+ *   1  MANVIL_MEM_QUERY_COMMIT_SIZE  physical pages committed
+ *   2  MANVIL_MEM_QUERY_VA_SIZE      virtual pages reserved
+ *   3  MANVIL_MEM_QUERY_FLAGS        current flags
+ */
+union manvil_kbase_ioctl_mem_query {
+    struct {
+        uint64_t gpu_addr;
+        uint64_t query;
+    } in;
+    struct {
+        uint64_t value;
+    } out;
+};
+
 struct manvil_kbase_ioctl_mem_sync {
     uint64_t handle;
     uint64_t user_addr;
@@ -579,6 +598,9 @@ struct manvil_base_csf_notification {
 #define MANVIL_KBASE_IOCTL_MEM_FREE \
     MANVIL_IOW(MANVIL_KBASE_IOCTL_TYPE, 7, \
                struct manvil_kbase_ioctl_mem_free)
+#define MANVIL_KBASE_IOCTL_MEM_QUERY \
+    MANVIL_IOWR(MANVIL_KBASE_IOCTL_TYPE, 6, \
+                union manvil_kbase_ioctl_mem_query)
 #define MANVIL_KBASE_IOCTL_MEM_SYNC \
     MANVIL_IOW(MANVIL_KBASE_IOCTL_TYPE, 15, \
                struct manvil_kbase_ioctl_mem_sync)
