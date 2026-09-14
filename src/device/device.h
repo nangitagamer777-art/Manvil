@@ -91,6 +91,28 @@ struct manvil_csf_iface {
     uint32_t total_stream_num;
     uint32_t prfcnt_size;
     uint32_t instr_features;
+
+    /*
+     * Values extracted from the first CSI reported by the firmware.
+     * They describe the per stream capabilities that the firmware
+     * exposes at boot.
+     *
+     * work_registers      total number of 32-bit registers in the
+     *                     CS register file.
+     * scoreboards         number of scoreboard entries available for
+     *                     tracking asynchronous operations.
+     * user_register_base  index of the first register that userspace
+     *                     may use. The top four registers are
+     *                     reserved for the application; this is the
+     *                     index of the first of those four.
+     *
+     * The exact number of registers is a hardware property and can
+     * differ across GPU revisions. Manvil queries it at open time
+     * instead of hardcoding a value.
+     */
+    uint32_t work_registers;
+    uint32_t scoreboards;
+    uint32_t user_register_base;
 };
 
 /*

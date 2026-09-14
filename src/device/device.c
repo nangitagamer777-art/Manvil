@@ -96,7 +96,20 @@ static int device_set_flags(manvil_device *dev)
     struct manvil_kbase_ioctl_set_flags flags;
     memset(&flags, 0, sizeof(flags));
 
-    flags.create_flags = MANVIL_BASE_CONTEXT_CSF_EVENT_THREAD;
+    /*
+     * Pass zero for the context flags.
+     *
+     * The reference kbase implementation in the PanVK fork uses zero
+     * here with the comment that it is "for maximum compatibility"
+     * and that it also creates the kernel side context. The
+     * BASE_CONTEXT_CSF_EVENT_THREAD flag exists in the headers and
+     * is listed as allowed, but passing it causes the kernel to
+     * reject the ioctl with EINVAL on UAPI 1.20.
+     *
+     * Zero is accepted by every version we have tested and is the
+     * safest choice.
+     */
+    flags.create_flags = 0;
 
     int rc = manvil_kbase_ioctl(dev->kbase, MANVIL_KBASE_IOCTL_SET_FLAGS,
                                 &flags, "SET_FLAGS");
@@ -155,6 +168,11 @@ static int device_get_gpuprops_size(manvil_device *dev, uint32_t *out_size)
     args.size = 0;
     args.flags = 0;
 
+    /*
+     * The kernel returns the required buffer size as the ioctl
+     * return value, not by writing into args.size. A non-negative
+     * return value is the size in bytes.
+     */
     int rc = manvil_kbase_ioctl(dev->kbase, MANVIL_KBASE_IOCTL_GET_GPUPROPS,
                                 &args, "GET_GPUPROPS(size)");
     if (rc < 0) {
@@ -163,7 +181,12 @@ static int device_get_gpuprops_size(manvil_device *dev, uint32_t *out_size)
         return -1;
     }
 
-    *out_size = args.size;
+    if (rc == 0) {
+        device_set_error(dev, "GET_GPUPROPS reported a zero size");
+        return -1;
+    }
+
+    *out_size = (uint32_t)rc;
     return 0;
 }
 
@@ -355,6 +378,64 @@ static int device_read_csf_iface(manvil_device *dev)
         device_set_error(dev, "CS_GET_GLB_IFACE reported zero groups");
         return -1;
     }
+
+    /*
+     * Second pass: retrieve the per stream capability structures.
+     *
+     * The features field of the first stream carries the total
+     * number of registers in the CS register file (bits 0-7, minus
+     * one) and the number of scoreboards (bits 8-15, minus one).
+     * Those values determine where in the register file the
+     * application-owned registers begin. Hardcoding them would
+     * break on any GPU revision with a different register file
+     * size.
+     *
+     * We ask the kernel for a single stream. That is enough to learn
+     * the register file size, which is a property of the CS
+     * interface rather than of individual streams.
+     */
+    struct manvil_basep_cs_stream_control stream_data;
+    memset(&stream_data, 0, sizeof(stream_data));
+
+    union manvil_kbase_ioctl_cs_get_glb_iface stream_args;
+    memset(&stream_args, 0, sizeof(stream_args));
+
+    stream_args.in.max_group_num = 0;
+    stream_args.in.max_total_stream_num = 1;
+    stream_args.in.groups_ptr = 0;
+    stream_args.in.streams_ptr =
+        (uint64_t)(uintptr_t)&stream_data;
+
+    rc = manvil_kbase_ioctl(dev->kbase,
+                            MANVIL_KBASE_IOCTL_CS_GET_GLB_IFACE,
+                            &stream_args, "CS_GET_GLB_IFACE(stream)");
+    if (rc < 0) {
+        device_set_error(dev, "CS_GET_GLB_IFACE stream query failed: %s",
+                         strerror(errno));
+        return -1;
+    }
+
+    /*
+     * Decode the feature field.
+     *
+     * The register file size and the scoreboard count are encoded as
+     * "value - 1". A value of zero in the field means one register
+     * or one scoreboard.
+     */
+    uint32_t stream_features = stream_data.features;
+    uint32_t work_regs = (stream_features & 0xFFu) + 1u;
+    uint32_t scoreboards = ((stream_features >> 8) & 0xFFu) + 1u;
+
+    /*
+     * The top four registers are reserved for the application. The
+     * register file may be as small as four registers in theory;
+     * guard against an underflow that would make the base wrap.
+     */
+    uint32_t user_base = (work_regs >= 4u) ? (work_regs - 4u) : 0u;
+
+    dev->csf_iface.work_registers = work_regs;
+    dev->csf_iface.scoreboards = scoreboards;
+    dev->csf_iface.user_register_base = user_base;
 
     return 0;
 }

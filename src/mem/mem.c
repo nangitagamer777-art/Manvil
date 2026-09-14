@@ -9,6 +9,8 @@
 #include "mem.h"
 
 #include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -27,10 +29,38 @@
  */
 struct manvil_mem {
     manvil_kbase *kbase;
+
+    /*
+     * The GPU virtual address of the region.
+     *
+     * For SAME_VA allocations this is equal to the CPU mapping
+     * address, because the kernel guarantees that CPU VA and GPU VA
+     * are identical. The value returned by the MEM_ALLOC ioctl in
+     * that case is a cookie, not a usable GPU VA, and becomes stale
+     * as soon as the mmap succeeds.
+     *
+     * For non-SAME_VA allocations (executable regions and similar)
+     * this is the value returned by MEM_ALLOC and the mmap offset is
+     * the same value.
+     */
     uint64_t      gpu_va;
+
+    /*
+     * Cookie as returned by MEM_ALLOC. Only meaningful for SAME_VA
+     * allocations where it is used as the mmap offset. Kept for
+     * diagnostic and for error paths.
+     */
+    uint64_t      cookie;
+
     uint64_t      size_bytes;
     void         *cpu_ptr;
     uint64_t      flags;
+
+    /*
+     * True if the allocation used the SAME_VA model. In that case the
+     * lifetime is managed through munmap instead of MEM_FREE.
+     */
+    bool          same_va;
 };
 
 /*
@@ -75,8 +105,20 @@ static int mem_do_alloc(manvil_kbase *kbase,
     int rc = manvil_kbase_ioctl(kbase, MANVIL_KBASE_IOCTL_MEM_ALLOC,
                                 &alloc, "MEM_ALLOC");
     if (rc < 0) {
+        fprintf(stderr, "[manvil] MEM_ALLOC args: "
+                        "va_pages=%llu commit_pages=%llu extension=%llu "
+                        "flags=0x%llx\n",
+                        (unsigned long long)alloc.in.va_pages,
+                        (unsigned long long)alloc.in.commit_pages,
+                        (unsigned long long)alloc.in.extension,
+                        (unsigned long long)alloc.in.flags);
         return -1;
     }
+
+    fprintf(stderr, "[manvil] MEM_ALLOC result: "
+                    "gpu_va=0x%016llx flags=0x%llx\n",
+                    (unsigned long long)alloc.out.gpu_va,
+                    (unsigned long long)alloc.out.flags);
 
     *out_cookie = alloc.out.gpu_va;
     return 0;
@@ -99,11 +141,6 @@ static void *mem_do_mmap(manvil_kbase *kbase,
     if (flags & MANVIL_MEM_CPU_READ)  prot |= PROT_READ;
     if (flags & MANVIL_MEM_CPU_WRITE) prot |= PROT_WRITE;
 
-    /*
-     * If the caller requested a GPU only region, the kernel may still
-     * create the mapping. Use PROT_READ at minimum so that the region
-     * can be inspected during debugging without segfaulting.
-     */
     if (prot == 0) {
         prot = PROT_READ;
     }
@@ -111,8 +148,16 @@ static void *mem_do_mmap(manvil_kbase *kbase,
     void *addr = mmap(NULL, size_bytes, prot, MAP_SHARED,
                       manvil_kbase_fd(kbase), (off_t)cookie);
     if (addr == MAP_FAILED) {
+        fprintf(stderr, "[manvil] mmap(cookie=0x%016llx, size=%llu) FAILED: %s\n",
+                (unsigned long long)cookie,
+                (unsigned long long)size_bytes,
+                strerror(errno));
         return NULL;
     }
+    fprintf(stderr, "[manvil] mmap(cookie=0x%016llx, size=%llu) -> %p\n",
+            (unsigned long long)cookie,
+            (unsigned long long)size_bytes,
+            addr);
     return addr;
 }
 
@@ -135,32 +180,48 @@ manvil_mem *manvil_mem_alloc(manvil_kbase *kbase,
     void *cpu_ptr = mem_do_mmap(kbase, cookie, aligned, flags);
     if (cpu_ptr == NULL) {
         /*
-         * Undo the allocation to avoid leaking GPU memory.
+         * The mmap failed, so the cookie is still the only handle
+         * for the region. Release it with MEM_FREE, which is the
+         * correct operation for a pending cookie that was never
+         * mapped.
          */
         struct manvil_kbase_ioctl_mem_free free_args;
         memset(&free_args, 0, sizeof(free_args));
         free_args.gpu_addr = cookie;
         (void)manvil_kbase_ioctl(kbase, MANVIL_KBASE_IOCTL_MEM_FREE,
-                                 &free_args, "MEM_FREE (rollback)");
+                                 &free_args, "MEM_FREE (pending cookie rollback)");
         return NULL;
     }
 
     manvil_mem *mem = calloc(1, sizeof(*mem));
     if (mem == NULL) {
-        struct manvil_kbase_ioctl_mem_free free_args;
-        memset(&free_args, 0, sizeof(free_args));
-        free_args.gpu_addr = cookie;
-        (void)manvil_kbase_ioctl(kbase, MANVIL_KBASE_IOCTL_MEM_FREE,
-                                 &free_args, "MEM_FREE (rollback)");
+        /*
+         * The mmap succeeded, so we must undo the mapping. Using
+         * munmap is the correct way to release a SAME_VA region.
+         */
+        munmap(cpu_ptr, aligned);
         errno = ENOMEM;
         return NULL;
     }
 
+    /*
+     * Determine whether this allocation uses the SAME_VA model. On
+     * SAME_VA, the kernel guarantees that the CPU mapping address
+     * equals the GPU virtual address. That address is the one to
+     * pass in every subsequent ioctl (register queue, sync, etc.).
+     *
+     * On non-SAME_VA the kernel returned a real GPU VA in the cookie
+     * field, and the mmap offset was the same value.
+     */
+    bool same_va = (flags & MANVIL_BASE_MEM_SAME_VA) != 0;
+
     mem->kbase      = kbase;
-    mem->gpu_va     = cookie;
+    mem->cookie     = cookie;
     mem->size_bytes = aligned;
     mem->cpu_ptr    = cpu_ptr;
     mem->flags      = flags;
+    mem->same_va    = same_va;
+    mem->gpu_va     = same_va ? (uint64_t)(uintptr_t)cpu_ptr : cookie;
 
     return mem;
 }
@@ -186,18 +247,30 @@ void manvil_mem_free(manvil_mem *mem)
         return;
     }
 
-    /*
-     * Freeing the GPU region also tears down the userspace mapping.
-     * Do not munmap explicitly, because on SAME_VA allocations the
-     * munmap would destroy the GPU mapping before the region is
-     * released, leaving the kernel in an inconsistent state.
-     */
-    struct manvil_kbase_ioctl_mem_free free_args;
-    memset(&free_args, 0, sizeof(free_args));
-    free_args.gpu_addr = mem->gpu_va;
+    if (mem->same_va) {
+        /*
+         * SAME_VA regions are released with munmap. The kernel tears
+         * down the GPU mapping as part of the munmap, so no MEM_FREE
+         * ioctl is issued. Calling MEM_FREE on a SAME_VA region that
+         * has already been mapped returns EINVAL, because the cookie
+         * has been consumed by the mmap.
+         */
+        if (mem->cpu_ptr != NULL) {
+            munmap(mem->cpu_ptr, mem->size_bytes);
+        }
+    } else {
+        /*
+         * Non-SAME_VA regions (executable and zone allocations) are
+         * released with MEM_FREE on the GPU VA. The mmap, if any, is
+         * torn down by the kernel as part of the ioctl.
+         */
+        struct manvil_kbase_ioctl_mem_free free_args;
+        memset(&free_args, 0, sizeof(free_args));
+        free_args.gpu_addr = mem->gpu_va;
 
-    (void)manvil_kbase_ioctl(mem->kbase, MANVIL_KBASE_IOCTL_MEM_FREE,
-                             &free_args, "MEM_FREE");
+        (void)manvil_kbase_ioctl(mem->kbase, MANVIL_KBASE_IOCTL_MEM_FREE,
+                                 &free_args, "MEM_FREE");
+    }
 
     memset(mem, 0, sizeof(*mem));
     free(mem);

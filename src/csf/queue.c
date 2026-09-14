@@ -9,6 +9,7 @@
 #include "queue.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -47,18 +48,24 @@ struct manvil_queue {
     /*
      * Cached pointers into the mapping.
      *
-     * cs_insert and cs_extract point to the u32 fields in the input
-     * and output pages. They are volatile because the firmware
-     * updates cs_extract without going through the kernel.
+     * cs_insert and cs_extract point to u64 fields in the input and
+     * output pages. The doorbell is a u32 hardware register. All
+     * three are volatile because the firmware and the hardware
+     * update or observe them without going through the kernel.
      */
-    volatile uint32_t *cs_insert;
-    volatile uint32_t *cs_extract;
+    volatile uint64_t *cs_insert;
+    volatile uint64_t *cs_extract;
     volatile uint32_t *doorbell;
 
     /*
      * Local copy of CS_INSERT. Not published until kick.
+     *
+     * The value is a 64-bit unsigned integer to match the width of
+     * the CS_INSERT register itself. The ring size is much smaller,
+     * but keeping the same width avoids casts throughout the code
+     * and makes the arithmetic consistent with the register.
      */
-    uint32_t cs_insert_value;
+    uint64_t cs_insert_value;
 
     /*
      * State flags.
@@ -111,6 +118,11 @@ static int queue_do_register(manvil_queue *queue)
     args.buffer_gpu_addr = manvil_mem_gpu_va(queue->ring_mem);
     args.buffer_size     = queue->ring_size;
     args.priority        = 0;
+
+    fprintf(stderr, "[manvil] CS_QUEUE_REGISTER args: "
+                    "buffer_gpu_addr=0x%016llx buffer_size=%u priority=%u\n",
+                    (unsigned long long)args.buffer_gpu_addr,
+                    args.buffer_size, args.priority);
 
     int rc = manvil_kbase_ioctl(queue->kbase,
                                 MANVIL_KBASE_IOCTL_CS_QUEUE_REGISTER,
@@ -177,15 +189,19 @@ static int queue_do_bind(manvil_queue *queue)
     queue->user_io_size = mmap_size;
 
     /*
-     * Cache the pointers to the individual registers. The input page
-     * holds CS_INSERT, the output page holds CS_EXTRACT. Both are u32
-     * values at the offsets defined in queue.h.
+     * Cache the pointers to the individual registers.
+     *
+     * The three pages of the user IO mapping are, in order: the
+     * doorbell, the input page, and the output page. The input page
+     * holds CS_INSERT as a 64-bit value. The output page holds
+     * CS_EXTRACT as a 64-bit value. The doorbell is a 32-bit
+     * hardware register.
      */
     uint8_t *base = (uint8_t *)addr;
-    queue->cs_insert = (volatile uint32_t *)
-        (base + MANVIL_QUEUE_OFFSET_INPUT + MANVIL_CS_INSERT_LO);
-    queue->cs_extract = (volatile uint32_t *)
-        (base + MANVIL_QUEUE_OFFSET_OUTPUT + MANVIL_CS_EXTRACT_LO);
+    queue->cs_insert = (volatile uint64_t *)
+        (base + MANVIL_QUEUE_OFFSET_INPUT + MANVIL_CS_INSERT_OFFSET);
+    queue->cs_extract = (volatile uint64_t *)
+        (base + MANVIL_QUEUE_OFFSET_OUTPUT + MANVIL_CS_EXTRACT_OFFSET);
     queue->doorbell = (volatile uint32_t *)
         (base + MANVIL_QUEUE_OFFSET_DOORBELL);
 
@@ -311,11 +327,11 @@ manvil_queue *manvil_queue_create(manvil_kbase *kbase,
  * kernel), CS_EXTRACT is read from the output page and reflects the
  * firmware progress.
  */
-static uint32_t queue_bytes_in_flight(const manvil_queue *queue)
+static uint64_t queue_bytes_in_flight(const manvil_queue *queue)
 {
-    uint32_t insert = queue->cs_insert_value;
-    uint32_t extract = *queue->cs_extract;
-    uint32_t size = queue->ring_size;
+    uint64_t insert = queue->cs_insert_value;
+    uint64_t extract = *queue->cs_extract;
+    uint64_t size = queue->ring_size;
 
     if (insert >= extract) {
         return insert - extract;
@@ -345,7 +361,7 @@ static void queue_copy_into_ring(manvil_queue *queue,
 {
     uint8_t *ring = (uint8_t *)manvil_mem_cpu_ptr(queue->ring_mem);
     uint32_t size_u32 = queue->ring_size;
-    uint32_t pos = queue->cs_insert_value % size_u32;
+    uint32_t pos = (uint32_t)(queue->cs_insert_value % size_u32);
 
     uint32_t first = size_u32 - pos;
     if (first > size) {
@@ -381,8 +397,8 @@ int manvil_queue_write(manvil_queue *queue, const void *data, size_t size)
         return -1;
     }
 
-    uint32_t used = queue_bytes_in_flight(queue);
-    uint32_t capacity = queue->ring_size - 1u;
+    uint64_t used = queue_bytes_in_flight(queue);
+    uint64_t capacity = queue->ring_size - 1u;
 
     if (used > capacity || size > capacity - used) {
         errno = ENOSPC;
@@ -390,12 +406,12 @@ int manvil_queue_write(manvil_queue *queue, const void *data, size_t size)
     }
 
     queue_copy_into_ring(queue, (const uint8_t *)data, size);
-    queue->cs_insert_value += (uint32_t)size;
+    queue->cs_insert_value += (uint64_t)size;
 
     return 0;
 }
 
-uint32_t manvil_queue_space_used(const manvil_queue *queue)
+uint64_t manvil_queue_space_used(const manvil_queue *queue)
 {
     if (queue == NULL || !queue->is_valid) {
         return 0;
@@ -403,14 +419,14 @@ uint32_t manvil_queue_space_used(const manvil_queue *queue)
     return queue_bytes_in_flight(queue);
 }
 
-uint32_t manvil_queue_space_free(const manvil_queue *queue)
+uint64_t manvil_queue_space_free(const manvil_queue *queue)
 {
     if (queue == NULL || !queue->is_valid) {
         return 0;
     }
 
-    uint32_t used = queue_bytes_in_flight(queue);
-    uint32_t capacity = queue->ring_size - 1u;
+    uint64_t used = queue_bytes_in_flight(queue);
+    uint64_t capacity = queue->ring_size - 1u;
     return (used >= capacity) ? 0 : capacity - used;
 }
 
@@ -440,6 +456,31 @@ int manvil_queue_kick(manvil_queue *queue)
      * from zero to non-zero. Writing 1 is the conventional choice.
      */
     *queue->doorbell = 1u;
+
+    /*
+     * Notify the kernel scheduler through the CS_QUEUE_KICK ioctl.
+     *
+     * The doorbell write is a direct signal to the firmware and is
+     * sufficient when the queue is already resident on a CSG slot.
+     * A freshly bound queue is not yet resident: the kernel must
+     * move it to RUNNABLE and ask the scheduler to assign it a
+     * slot. That notification happens through this ioctl.
+     *
+     * Manvil issues the ioctl on every kick. The cost is a single
+     * system call, and the kernel treats a redundant kick as a
+     * no-op when the queue is already scheduled.
+     */
+    struct manvil_kbase_ioctl_cs_queue_kick args;
+    memset(&args, 0, sizeof(args));
+    args.buffer_gpu_addr = manvil_mem_gpu_va(queue->ring_mem);
+
+    int rc = manvil_kbase_ioctl(queue->kbase,
+                                MANVIL_KBASE_IOCTL_CS_QUEUE_KICK,
+                                &args,
+                                "CS_QUEUE_KICK");
+    if (rc < 0) {
+        return -1;
+    }
 
     return 0;
 }
@@ -534,12 +575,12 @@ bool manvil_queue_is_valid(const manvil_queue *queue)
     return queue != NULL && queue->is_valid;
 }
 
-uint32_t manvil_queue_cs_insert(const manvil_queue *queue)
+uint64_t manvil_queue_cs_insert(const manvil_queue *queue)
 {
     return queue != NULL ? queue->cs_insert_value : 0;
 }
 
-uint32_t manvil_queue_cs_extract(const manvil_queue *queue)
+uint64_t manvil_queue_cs_extract(const manvil_queue *queue)
 {
     if (queue == NULL || queue->cs_extract == NULL) {
         return 0;

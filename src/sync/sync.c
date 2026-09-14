@@ -90,7 +90,8 @@ manvil_sync *manvil_sync_create(manvil_kbase *kbase, bool cross_group)
     uint32_t flags = MANVIL_MEM_CPU_READ |
                      MANVIL_MEM_CPU_WRITE |
                      MANVIL_MEM_GPU_READ |
-                     MANVIL_MEM_GPU_WRITE;
+                     MANVIL_MEM_GPU_WRITE |
+                     MANVIL_MEM_SAME_VA;
     if (cross_group) {
         flags |= MANVIL_BASE_MEM_CSF_EVENT;
     }

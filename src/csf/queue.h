@@ -84,23 +84,33 @@ typedef struct manvil_queue manvil_queue;
 #define MANVIL_QUEUE_USER_IO_PAGES 3
 
 /*
- * Offsets inside the user IO mapping, in bytes.
+ * Layout of the three pages mapped at queue bind time.
+ *
+ * The order is fixed by the kernel: the first page holds the
+ * hardware doorbell, the second holds the CS input registers, the
+ * third holds the CS output registers. An earlier version of this
+ * header had the pages in the wrong order, which made the firmware
+ * never observe the published insert offset.
+ *
+ * +0x0000  doorbell   hardware page, written to signal new work
+ * +0x1000  input      CS_INSERT and CS_EXTRACT_INIT
+ * +0x2000  output     CS_EXTRACT and CS_ACTIVE
  */
-#define MANVIL_QUEUE_OFFSET_INPUT  (0u * 0x1000u)
-#define MANVIL_QUEUE_OFFSET_OUTPUT (1u * 0x1000u)
-#define MANVIL_QUEUE_OFFSET_DOORBELL (2u * 0x1000u)
+#define MANVIL_QUEUE_OFFSET_DOORBELL (0u * 0x1000u)
+#define MANVIL_QUEUE_OFFSET_INPUT    (1u * 0x1000u)
+#define MANVIL_QUEUE_OFFSET_OUTPUT   (2u * 0x1000u)
 
 /*
  * Register offsets inside the input and output pages.
  *
- * These are the same offsets defined by the CSF register map. They
- * are reproduced here so that the queue module does not need to
- * include the whole register header.
+ * Both CS_INSERT and CS_EXTRACT are 64-bit values. CS_ACTIVE is a
+ * 32-bit value. These definitions match the public UAPI header
+ * distributed with Mesa 3D.
  */
-#define MANVIL_CS_INSERT_LO        0x0000u
-#define MANVIL_CS_EXTRACT_INIT_LO  0x0008u
-#define MANVIL_CS_EXTRACT_LO       0x0000u
-#define MANVIL_CS_ACTIVE_LO        0x0008u
+#define MANVIL_CS_INSERT_OFFSET        0x0000u
+#define MANVIL_CS_EXTRACT_INIT_OFFSET  0x0008u
+#define MANVIL_CS_EXTRACT_OFFSET       0x0000u
+#define MANVIL_CS_ACTIVE_OFFSET        0x0008u
 
 /*
  * Create a queue, register it, bind it to a group, and map the user
@@ -168,13 +178,13 @@ int manvil_queue_write(manvil_queue *queue, const void *data, size_t size);
  * Number of bytes currently in flight, between CS_EXTRACT and the
  * local CS_INSERT.
  */
-uint32_t manvil_queue_space_used(const manvil_queue *queue);
+uint64_t manvil_queue_space_used(const manvil_queue *queue);
 
 /*
  * Number of bytes available for new entries. This is the usable
  * capacity minus the space currently used.
  */
-uint32_t manvil_queue_space_free(const manvil_queue *queue);
+uint64_t manvil_queue_space_free(const manvil_queue *queue);
 
 /*
  * Publish the current CS_INSERT and ring the doorbell.
@@ -205,8 +215,8 @@ bool        manvil_queue_is_valid(const manvil_queue *queue);
  * the kernel until kick is called. CS_EXTRACT reflects the firmware
  * progress.
  */
-uint32_t manvil_queue_cs_insert(const manvil_queue *queue);
-uint32_t manvil_queue_cs_extract(const manvil_queue *queue);
+uint64_t manvil_queue_cs_insert(const manvil_queue *queue);
+uint64_t manvil_queue_cs_extract(const manvil_queue *queue);
 
 /*
  * True if the queue has no entries in flight, meaning CS_EXTRACT has
