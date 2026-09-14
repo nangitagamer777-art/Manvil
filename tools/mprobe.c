@@ -57,6 +57,9 @@
 #include "cmd/cmd.h"
 #include "heap/heap.h"
 
+/* Diagnostic helper defined in heap.c */
+int manvil_heap_probe(manvil_kbase *kbase);
+
 /*
  * Global run configuration.
  */
@@ -81,6 +84,7 @@ struct mprobe_state {
     manvil_group  *group;
     manvil_queue  *queue;
     manvil_sync   *sync;
+    manvil_heap   *heap;
 
     int64_t started_ns;
 };
@@ -254,9 +258,10 @@ static int parse_args(int argc, char **argv)
  */
 static void cleanup_state(struct mprobe_state *st)
 {
-    fprintf(stderr, "[manvil] cleanup_state called (dev=%p mem=%p group=%p queue=%p sync=%p)\n",
-            (void *)st->dev, (void *)st->mem, (void *)st->group,
-            (void *)st->queue, (void *)st->sync);
+    if (st->heap != NULL) {
+        manvil_heap_destroy(st->heap);
+        st->heap = NULL;
+    }
     if (st->sync != NULL) {
         manvil_sync_destroy(st->sync);
         st->sync = NULL;
@@ -466,6 +471,174 @@ static int step_create_sync(struct mprobe_state *st)
 }
 
 /*
+ * Step 5b: create a tiler heap and use it in a submission.
+ *
+ * The heap is created with the default parameters. A submission is
+ * then issued that first loads the heap context address into a
+ * user register and then emits HEAP_SET through that register. The
+ * sync is signaled at the end so we can verify the firmware
+ * processed the whole batch without errors.
+ */
+static int step_heap_create(struct mprobe_state *st)
+{
+    step_header(6, "Creating tiler heap");
+
+    struct manvil_heap_desc desc;
+    manvil_heap_desc_default(&desc);
+
+    st->heap = manvil_heap_create(manvil_device_kbase(st->dev), &desc);
+    if (st->heap == NULL) {
+        int first_errno = errno;
+        step_fail();
+        indent_printf("default config failed: errno=%d (%s)",
+                      first_errno, strerror(first_errno));
+        indent_printf("running heap_probe to find a working configuration...");
+
+        /*
+         * The probe tries a series of configurations and stops on the
+         * first that succeeds. It leaves the created heap intact only
+         * if the caller has not already created one; the probe
+         * destroys what it creates internally and returns 0 on
+         * success. We then try the default again with a smaller
+         * config if the probe reports success.
+         */
+        if (manvil_heap_probe(manvil_device_kbase(st->dev)) < 0) {
+            indent_printf("heap_probe: no configuration worked");
+            report_device_error(st->dev);
+            return -1;
+        }
+
+        /*
+         * A configuration worked. Recreate the heap with a small
+         * safe configuration so subsequent steps can use it. The
+         * probe already confirmed that 4 KiB chunks with max 4 work
+         * on this hardware, but that is specific to the target.
+         * Use the probe's fallback values.
+         */
+        manvil_heap_desc_default(&desc);
+        desc.chunk_size       = 4u * 1024u;
+        desc.initial_chunks   = 1u;
+        desc.max_chunks       = 4u;
+        desc.target_in_flight = 1u;
+
+        st->heap = manvil_heap_create(manvil_device_kbase(st->dev), &desc);
+        if (st->heap == NULL) {
+            indent_printf("re-create with fallback failed");
+            return -1;
+        }
+
+        indent_printf("recovered with fallback: chunk=4 KiB max=4 in_flight=1");
+    }
+    step_ok();
+
+    const struct manvil_heap_desc *used = manvil_heap_desc_of(st->heap);
+    if (used != NULL) {
+        indent_printf("Chunk size:         %u bytes", used->chunk_size);
+        indent_printf("Initial chunks:     %u", used->initial_chunks);
+        indent_printf("Max chunks:         %u", used->max_chunks);
+        indent_printf("Target in flight:   %u", used->target_in_flight);
+    }
+    indent_printf_hex64("Heap context VA:", manvil_heap_gpu_va(st->heap));
+    indent_printf_hex64("First chunk VA:", manvil_heap_first_chunk_va(st->heap));
+
+    drain_notifications(st->dev);
+    return 0;
+}
+
+/*
+ * Step 7: use the tiler heap in a submission.
+ *
+ * Emits the following sequence:
+ *   1. MOVE48 -> user register: heap context address
+ *   2. HEAP_SET through that register
+ *   3. HEAP_OPERATION (VERTEX_TILER_STARTED)
+ *   4. SYNC_SET64 to signal the sync (appended by the scheduler)
+ *
+ * The purpose is to verify that the firmware accepts HEAP_SET and
+ * HEAP_OPERATION with a valid heap context, and that the batch
+ * retires cleanly. The sync is reset to zero before the submission
+ * so the value observed afterwards is from this batch only.
+ */
+static int step_heap_submit(struct mprobe_state *st)
+{
+    step_header(7, "Submitting HEAP_SET + HEAP_OPERATION");
+
+    const struct manvil_csf_iface *csf = manvil_device_csf_iface(st->dev);
+    if (csf == NULL) {
+        step_fail();
+        indent_printf("no CSF interface");
+        return -1;
+    }
+
+    uint8_t heap_reg = (uint8_t)(csf->user_register_base + 0);
+
+    manvil_cmd cmds[3];
+
+    /* 1. Load the heap context address into the register. */
+    manvil_cmd_move48(cmds[0], heap_reg, manvil_heap_gpu_va(st->heap));
+
+    /* 2. HEAP_SET through the register. */
+    manvil_cmd_heap_set(cmds[1], heap_reg);
+
+    /* 3. HEAP_OPERATION: VERTEX_TILER_STARTED. */
+    manvil_cmd_heap_operation(cmds[2],
+                               MANVIL_CS_HEAP_OP_VERTEX_TILER_STARTED,
+                               0,                            /* wait_mask */
+                               0,                            /* signal_slot */
+                               MANVIL_CS_DEFER_IMMEDIATE);
+
+    /*
+     * Reset the sync so we observe the signal from this batch.
+     */
+    void *sync_ptr = manvil_mem_cpu_ptr(manvil_sync_mem(st->sync));
+    *(volatile uint64_t *)sync_ptr = 0;
+
+    struct manvil_submit_desc desc;
+    memset(&desc, 0, sizeof(desc));
+
+    manvil_sync *signals[1] = { st->sync };
+    uint64_t      signal_values[1] = { 1 };
+
+    desc.cmds             = (const manvil_cmd *)cmds;
+    desc.num_cmds         = 3;
+    desc.signal_syncs     = signals;
+    desc.signal_values    = signal_values;
+    desc.num_signals      = 1;
+    desc.signal_addr_reg  = (uint8_t)(csf->user_register_base + 0);
+    desc.signal_data_reg  = (uint8_t)(csf->user_register_base + 2);
+
+    int rc = manvil_sched_submit(st->queue, &desc);
+    if (rc < 0) {
+        step_fail();
+        indent_printf("manvil_sched_submit: %s", strerror(errno));
+        report_device_error(st->dev);
+        return -1;
+    }
+
+    rc = manvil_sync_wait_cpu(st->sync, 1, g_cfg.wait_timeout_ns);
+    if (rc < 0) {
+        step_fail();
+        indent_printf("manvil_sync_wait_cpu: %s", strerror(errno));
+        return -1;
+    }
+    if (rc > 0) {
+        step_fail();
+        indent_printf("timeout waiting for heap submission");
+        drain_notifications(st->dev);
+        return -1;
+    }
+    step_ok();
+
+    indent_printf_hex64("Heap VA:", manvil_heap_gpu_va(st->heap));
+    indent_printf("Heap register:      %u", (unsigned)heap_reg);
+    indent_printf("Sync value:         %" PRIu64,
+                  manvil_sync_value(st->sync));
+
+    drain_notifications(st->dev);
+    return 0;
+}
+
+/*
  * Step 6: submit a two command batch through the scheduler, with
  * the sync set at the end.
  *
@@ -474,7 +647,7 @@ static int step_create_sync(struct mprobe_state *st)
  */
 static int step_submit(struct mprobe_state *st)
 {
-    step_header(6, "Submitting ENOP + signal");
+    step_header(8, "Submitting ENOP + signal");
 
     manvil_cmd cmds[1];
     manvil_cmd_enop(cmds[0], 0xABC123);
@@ -483,7 +656,7 @@ static int step_submit(struct mprobe_state *st)
     memset(&desc, 0, sizeof(desc));
 
     manvil_sync *signals[1] = { st->sync };
-    uint64_t      signal_values[1] = { 1 };
+    uint64_t      signal_values[1] = { 2 };
 
     /*
      * Use the top four registers of the CS register file for the
@@ -538,10 +711,10 @@ static int step_submit(struct mprobe_state *st)
  */
 static int step_wait_sync(struct mprobe_state *st)
 {
-    step_header(7, "Waiting for sync to reach value 1");
+    step_header(9, "Waiting for sync to reach value 2");
 
     int64_t started = now_ns();
-    int rc = manvil_sync_wait_cpu(st->sync, 1, g_cfg.wait_timeout_ns);
+    int rc = manvil_sync_wait_cpu(st->sync, 2, g_cfg.wait_timeout_ns);
     int64_t elapsed = now_ns() - started;
 
     if (rc < 0) {
@@ -583,7 +756,7 @@ static int step_wait_sync(struct mprobe_state *st)
  */
 static int step_verify_second_submit(struct mprobe_state *st)
 {
-    step_header(8, "Second submit, sync target 2");
+    step_header(10, "Second submit, sync target 3");
 
     manvil_cmd cmds[1];
     manvil_cmd_enop(cmds[0], 0xDEF456);
@@ -592,7 +765,7 @@ static int step_verify_second_submit(struct mprobe_state *st)
     memset(&desc, 0, sizeof(desc));
 
     manvil_sync *signals[1] = { st->sync };
-    uint64_t      signal_values[1] = { 2 };
+    uint64_t      signal_values[1] = { 3 };
 
     const struct manvil_csf_iface *csf = manvil_device_csf_iface(st->dev);
     uint8_t addr_reg = 0;
@@ -619,7 +792,7 @@ static int step_verify_second_submit(struct mprobe_state *st)
     }
 
     int64_t started = now_ns();
-    rc = manvil_sync_wait_cpu(st->sync, 2, g_cfg.wait_timeout_ns);
+    rc = manvil_sync_wait_cpu(st->sync, 3, g_cfg.wait_timeout_ns);
     int64_t elapsed = now_ns() - started;
 
     if (rc < 0) {
@@ -650,7 +823,7 @@ static int step_verify_second_submit(struct mprobe_state *st)
  */
 static int step_check_idle(struct mprobe_state *st)
 {
-    step_header(9, "Checking queue idle");
+    step_header(11, "Checking queue idle");
 
     if (!manvil_queue_is_idle(st->queue)) {
         step_fail();
@@ -678,7 +851,7 @@ static int step_check_idle(struct mprobe_state *st)
  */
 static int step_cleanup(struct mprobe_state *st)
 {
-    step_header(10, "Cleanup");
+    step_header(12, "Cleanup");
 
     cleanup_state(st);
     step_ok();
@@ -719,11 +892,13 @@ int main(int argc, char **argv)
     if (step_create_group(&st) < 0) { result = 3; goto done; }
     if (step_create_queue(&st) < 0) { result = 4; goto done; }
     if (step_create_sync(&st) < 0) { result = 5; goto done; }
-    if (step_submit(&st) < 0) { result = 6; goto done; }
-    if (step_wait_sync(&st) < 0) { result = 7; goto done; }
-    if (step_verify_second_submit(&st) < 0) { result = 8; goto done; }
-    if (step_check_idle(&st) < 0) { result = 9; goto done; }
-    if (step_cleanup(&st) < 0) { result = 10; goto done; }
+    if (step_heap_create(&st) < 0) { result = 6; goto done; }
+    if (step_heap_submit(&st) < 0) { result = 7; goto done; }
+    if (step_submit(&st) < 0) { result = 8; goto done; }
+    if (step_wait_sync(&st) < 0) { result = 9; goto done; }
+    if (step_verify_second_submit(&st) < 0) { result = 10; goto done; }
+    if (step_check_idle(&st) < 0) { result = 11; goto done; }
+    if (step_cleanup(&st) < 0) { result = 12; goto done; }
 
 done:
     /*

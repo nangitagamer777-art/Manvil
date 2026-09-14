@@ -9,6 +9,7 @@
 #include "heap.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -132,6 +133,9 @@ static int heap_do_init(manvil_heap *heap)
                                     &args,
                                     "CS_TILER_HEAP_INIT(v2)");
         if (rc < 0) {
+            fprintf(stderr,
+                    "[manvil] heap_do_init(v2): rc=%d errno=%d (%s)\n",
+                    rc, errno, strerror(errno));
             return -1;
         }
 
@@ -152,6 +156,9 @@ static int heap_do_init(manvil_heap *heap)
                                     &args,
                                     "CS_TILER_HEAP_INIT(v1)");
         if (rc < 0) {
+            fprintf(stderr,
+                    "[manvil] heap_do_init(v1): rc=%d errno=%d (%s)\n",
+                    rc, errno, strerror(errno));
             return -1;
         }
 
@@ -166,11 +173,19 @@ manvil_heap *manvil_heap_create(manvil_kbase *kbase,
                                  const struct manvil_heap_desc *desc)
 {
     if (kbase == NULL || desc == NULL) {
+        fprintf(stderr, "[manvil] heap_create: NULL argument\n");
         errno = EINVAL;
         return NULL;
     }
 
+    fprintf(stderr,
+            "[manvil] heap_create: chunk_size=%u initial=%u max=%u in_flight=%u buf_desc=0x%llx\n",
+            desc->chunk_size, desc->initial_chunks, desc->max_chunks,
+            desc->target_in_flight,
+            (unsigned long long)desc->buf_desc_va);
+
     if (desc_validate(desc) < 0) {
+        fprintf(stderr, "[manvil] heap_create: desc_validate failed\n");
         return NULL;
     }
 
@@ -185,9 +200,15 @@ manvil_heap *manvil_heap_create(manvil_kbase *kbase,
     heap->is_valid   = false;
 
     if (heap_do_init(heap) < 0) {
+        fprintf(stderr, "[manvil] heap_create: heap_do_init failed\n");
         free(heap);
         return NULL;
     }
+
+    fprintf(stderr,
+            "[manvil] heap_create: OK gpu_va=0x%llx first_chunk=0x%llx\n",
+            (unsigned long long)heap->gpu_va,
+            (unsigned long long)heap->first_chunk_va);
 
     heap->is_valid = true;
     return heap;
@@ -248,4 +269,71 @@ bool manvil_heap_is_valid(const manvil_heap *heap)
 const struct manvil_heap_desc *manvil_heap_desc_of(const manvil_heap *heap)
 {
     return heap != NULL ? &heap->desc : NULL;
+}
+
+
+/*
+ * Diagnostic helper: try multiple tiler heap configurations and
+ * report which ones succeed. Used during bring-up to discover the
+ * actual limits of the target hardware.
+ */
+int manvil_heap_probe(manvil_kbase *kbase)
+{
+    static const struct {
+        uint32_t chunk_size;
+        uint32_t initial;
+        uint32_t max;
+        uint16_t in_flight;
+    } configs[] = {
+        /* Try the default first */
+        { 1u * 1024u * 1024u,  4u,  200u,  8u },
+        /* Smaller chunk */
+        { 256u * 1024u,        4u,  200u,  8u },
+        /* Even smaller */
+        { 64u * 1024u,         4u,  200u,  8u },
+        /* Minimal */
+        { 4u * 1024u,          4u,  200u,  8u },
+        /* Small max */
+        { 1u * 1024u * 1024u,  4u,  64u,   8u },
+        { 1u * 1024u * 1024u,  4u,  16u,   8u },
+        { 1u * 1024u * 1024u,  4u,  4u,    8u },
+        /* Only one chunk */
+        { 1u * 1024u * 1024u,  1u,  1u,    8u },
+        /* Tiny everything */
+        { 4u * 1024u,          1u,  4u,    8u },
+        /* Tiny in flight */
+        { 1u * 1024u * 1024u,  4u,  200u,  1u },
+    };
+
+    fprintf(stderr, "[manvil] heap_probe: trying %zu configurations\n",
+            sizeof(configs) / sizeof(configs[0]));
+
+    for (size_t i = 0; i < sizeof(configs) / sizeof(configs[0]); i++) {
+        struct manvil_heap_desc desc;
+        manvil_heap_desc_default(&desc);
+        desc.chunk_size       = configs[i].chunk_size;
+        desc.initial_chunks   = configs[i].initial;
+        desc.max_chunks       = configs[i].max;
+        desc.target_in_flight = configs[i].in_flight;
+
+        fprintf(stderr,
+                "[manvil] heap_probe[%zu]: chunk=%u initial=%u max=%u in_flight=%u\n",
+                i, desc.chunk_size, desc.initial_chunks, desc.max_chunks,
+                desc.target_in_flight);
+
+        manvil_heap *h = manvil_heap_create(kbase, &desc);
+        if (h == NULL) {
+            fprintf(stderr, "[manvil] heap_probe[%zu]: FAIL errno=%d (%s)\n",
+                    i, errno, strerror(errno));
+        } else {
+            fprintf(stderr, "[manvil] heap_probe[%zu]: OK gpu_va=0x%llx\n",
+                    i, (unsigned long long)manvil_heap_gpu_va(h));
+            manvil_heap_destroy(h);
+            return 0;
+        }
+    }
+
+    fprintf(stderr, "[manvil] heap_probe: all configurations failed\n");
+    errno = ENOMEM;
+    return -1;
 }

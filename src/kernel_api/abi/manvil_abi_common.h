@@ -312,6 +312,35 @@ struct manvil_kbase_ioctl_mem_exec_init {
     uint64_t va_pages;
 };
 
+/*
+ * JIT memory initialization.
+ *
+ * Must be called before any allocation that lands in the CUSTOM_VA
+ * zone. The tiler heap context allocator uses that zone, so a call
+ * to this ioctl is a prerequisite for CS_TILER_HEAP_INIT to succeed.
+ *
+ * The fields mirror the UAPI definition:
+ *
+ *   va_pages          size of the virtual address range reserved for
+ *                     the JIT allocator, in pages.
+ *   max_allocations   maximum number of concurrent JIT allocations,
+ *                     up to 255.
+ *   trim_level        percentage of physical pages to release on
+ *                     free, 0 to 100.
+ *   group_id          physical memory group id.
+ *   padding           must be zero.
+ *   phys_pages        maximum number of physical pages the JIT
+ *                     region can occupy.
+ */
+struct manvil_kbase_ioctl_mem_jit_init {
+    uint64_t va_pages;
+    uint8_t  max_allocations;
+    uint8_t  trim_level;
+    uint8_t  group_id;
+    uint8_t  padding[5];
+    uint64_t phys_pages;
+};
+
 struct manvil_kbase_ioctl_cs_queue_register {
     uint64_t buffer_gpu_addr;
     uint32_t buffer_size;
@@ -615,6 +644,10 @@ struct manvil_base_csf_notification {
 #define MANVIL_KBASE_IOCTL_MEM_EXEC_INIT \
     MANVIL_IOW(MANVIL_KBASE_IOCTL_TYPE, 38, \
                struct manvil_kbase_ioctl_mem_exec_init)
+
+#define MANVIL_KBASE_IOCTL_MEM_JIT_INIT \
+    MANVIL_IOW(MANVIL_KBASE_IOCTL_TYPE, 14, \
+               struct manvil_kbase_ioctl_mem_jit_init)
 #define MANVIL_KBASE_IOCTL_GET_CONTEXT_ID \
     MANVIL_IOR(MANVIL_KBASE_IOCTL_TYPE, 17, \
                struct manvil_kbase_ioctl_get_context_id)

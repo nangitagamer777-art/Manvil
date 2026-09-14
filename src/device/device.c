@@ -153,6 +153,72 @@ static int device_map_tracking_page(manvil_device *dev)
 }
 
 /*
+ * Initialize the memory zones that later allocations depend on.
+ *
+ * Two zones must be set up before any allocation that uses them:
+ *
+ *   EXEC_VA          used by executable allocations. Initialized by
+ *                    MEM_EXEC_INIT with a size in pages. Manvil asks
+ *                    for a modest range; the kernel may round it up.
+ *
+ *   CUSTOM_VA        used by the tiler heap context allocator. It is
+ *                    not created automatically. The kernel sets it up
+ *                    when the JIT allocator is initialized through
+ *                    MEM_JIT_INIT. Without that call, any allocation
+ *                    that lands in CUSTOM_VA fails with ENOMEM, which
+ *                    is what happens to CS_TILER_HEAP_INIT because
+ *                    the heap context lives there.
+ *
+ * Both calls are mandatory for a full featured device. The sizes
+ * chosen here are deliberately generous but small enough to be safe
+ * on any supported hardware.
+ */
+static int device_init_memory_zones(manvil_device *dev)
+{
+    /*
+     * EXEC_VA zone. 4096 pages is 16 MiB, which is more than enough
+     * for shader code and the small fixed allocations that go with
+     * it.
+     */
+    struct manvil_kbase_ioctl_mem_exec_init exec;
+    memset(&exec, 0, sizeof(exec));
+    exec.va_pages = 4096;
+
+    int rc = manvil_kbase_ioctl(dev->kbase,
+                                MANVIL_KBASE_IOCTL_MEM_EXEC_INIT,
+                                &exec,
+                                "MEM_EXEC_INIT");
+    if (rc < 0) {
+        device_set_error(dev, "MEM_EXEC_INIT failed: %s", strerror(errno));
+        return -1;
+    }
+
+    /*
+     * CUSTOM_VA zone, initialized through the JIT allocator. 4096
+     * pages is 16 MiB of reserved VA. The JIT allocator does not
+     * commit physical pages up front; they are populated on demand.
+     */
+    struct manvil_kbase_ioctl_mem_jit_init jit;
+    memset(&jit, 0, sizeof(jit));
+    jit.va_pages        = 4096;
+    jit.max_allocations = 32;
+    jit.trim_level      = 0;
+    jit.group_id        = 0;
+    jit.phys_pages      = 4096;
+
+    rc = manvil_kbase_ioctl(dev->kbase,
+                            MANVIL_KBASE_IOCTL_MEM_JIT_INIT,
+                            &jit,
+                            "MEM_JIT_INIT");
+    if (rc < 0) {
+        device_set_error(dev, "MEM_JIT_INIT failed: %s", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * Read the size of the GPU properties blob.
  *
  * The first call to GET_GPUPROPS uses size = 0 and buffer = 0. The
@@ -493,7 +559,18 @@ manvil_device *manvil_device_open(const char *path)
     }
 
     /*
-     * Step 4: read the GPU properties.
+     * Step 4: initialize the memory zones that later allocations
+     * depend on. EXEC_VA and CUSTOM_VA are both required. In
+     * particular CUSTOM_VA is needed for the tiler heap context, so
+     * this must happen before any heap is created.
+     */
+    if (device_init_memory_zones(dev) < 0) {
+        manvil_device_close(dev);
+        return NULL;
+    }
+
+    /*
+     * Step 5: read the GPU properties.
      */
     if (device_read_gpu_props(dev) < 0) {
         manvil_device_close(dev);
@@ -501,7 +578,7 @@ manvil_device *manvil_device_open(const char *path)
     }
 
     /*
-     * Step 5: read the CSF global interface.
+     * Step 6: read the CSF global interface.
      */
     if (device_read_csf_iface(dev) < 0) {
         manvil_device_close(dev);

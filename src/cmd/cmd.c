@@ -251,19 +251,15 @@ void manvil_cmd_flush_cache2(manvil_cmd cmd,
     cmd_set_opcode(cmd, MANVIL_CS_OPCODE_FLUSH_CACHE2);
 }
 
-void manvil_cmd_heap_set(manvil_cmd cmd, uint64_t address)
+void manvil_cmd_heap_set(manvil_cmd cmd, uint8_t address_reg)
 {
     cmd_zero(cmd);
 
     /*
-     * Address: bits 40-47 (8 bits).
-     *
-     * The address field is 8 bits wide, encoded in units of 256
-     * bytes. The heap context structures allocated by the kernel are
-     * aligned to a page boundary, so the low byte is always zero.
-     * The firmware reconstructs the full address by shifting left.
+     * Address: bits 40-47 (8 bits). Index of the register that
+     * holds the address of the heap context.
      */
-    cmd_write_field(cmd, 40u, 8u, (address >> 8) & 0xffu);
+    cmd_write_field(cmd, 40u, 8u, address_reg);
 
     cmd_set_opcode(cmd, MANVIL_CS_OPCODE_HEAP_SET);
 }

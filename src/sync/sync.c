@@ -18,6 +18,7 @@
 #include "sync.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -274,8 +275,19 @@ int manvil_sync_wait_cpu(manvil_sync *sync,
      * low. For sync objects that complete quickly, the first few
      * iterations complete without sleeping.
      */
+    int iteration = 0;
     for (;;) {
-        if (*sync_value_ptr(sync) >= target_value) {
+        uint64_t value = *sync_value_ptr(sync);
+
+        if (iteration < 3 || (iteration % 100) == 0) {
+            fprintf(stderr,
+                    "[manvil] sync_wait: iter=%d target=%llu value=%llu\n",
+                    iteration,
+                    (unsigned long long)target_value,
+                    (unsigned long long)value);
+        }
+
+        if (value >= target_value) {
             return 0;
         }
 
@@ -297,6 +309,7 @@ int manvil_sync_wait_cpu(manvil_sync *sync,
         delay.tv_sec = 0;
         delay.tv_nsec = 100000; /* 100 microseconds */
         nanosleep(&delay, NULL);
+        iteration++;
     }
 }
 

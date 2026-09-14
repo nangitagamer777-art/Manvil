@@ -256,13 +256,16 @@ void manvil_cmd_flush_cache2(manvil_cmd cmd,
 /*
  * Set the current tiler heap context.
  *
- * The firmware uses the address provided here as the heap context
- * structure for subsequent tiler operations. The address is the
- * gpu_heap_va returned by the CS_TILER_HEAP_INIT ioctl.
+ * The firmware uses the heap context structure for subsequent tiler
+ * operations. The address of the context is not encoded in the
+ * command itself: the command carries the index of a CS register
+ * that holds the address. Callers must load the address into the
+ * register with manvil_cmd_move48 before issuing this command.
  *
- * address     GPU virtual address of the heap context, in bytes.
+ * address_reg   index of the register holding the heap context
+ *               address, as returned by the CS_TILER_HEAP_INIT ioctl.
  */
-void manvil_cmd_heap_set(manvil_cmd cmd, uint64_t address);
+void manvil_cmd_heap_set(manvil_cmd cmd, uint8_t address_reg);
 
 /*
  * Emit a tiler heap operation.
