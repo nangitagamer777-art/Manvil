@@ -187,6 +187,14 @@
 #define MANVIL_BASEP_CQS_WAIT_OPERATION_LE 0u
 #define MANVIL_BASEP_CQS_WAIT_OPERATION_GT 1u
 
+/*
+ * The plain CQS wait form uses a greater-or-equal condition. The UAPI
+ * does not define a GE constant because the wait compares against a
+ * target and is satisfied when the value is at least that target. The
+ * alias below is a convenience for callers that want to be explicit.
+ */
+#define MANVIL_BASEP_CQS_WAIT_OPERATION_GE MANVIL_BASEP_CQS_WAIT_OPERATION_GT
+
 #define MANVIL_BASEP_CQS_SET_OPERATION_ADD 0u
 #define MANVIL_BASEP_CQS_SET_OPERATION_SET 1u
 
