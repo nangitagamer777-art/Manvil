@@ -59,6 +59,7 @@ typedef uint64_t manvil_cmd[2];
  * These values match the CS Opcode enum in the genxml specification.
  */
 #define MANVIL_CS_OPCODE_NOP             0u
+#define MANVIL_CS_OPCODE_MOVE48          1u
 #define MANVIL_CS_OPCODE_MOVE32          2u
 #define MANVIL_CS_OPCODE_WAIT            3u
 #define MANVIL_CS_OPCODE_RUN_COMPUTE     4u
@@ -282,24 +283,55 @@ void manvil_cmd_heap_operation(manvil_cmd cmd,
                                 uint8_t defer_mode);
 
 /*
+ * Load a 48-bit immediate into a CS register.
+ *
+ * The CS register file is addressed by index. The index must be less
+ * than the total number of registers in the file, which the firmware
+ * reports at boot through CS_GET_GLB_IFACE and which Manvil exposes
+ * as manvil_csf_iface.work_registers.
+ *
+ * The value must fit in 48 bits. GPU virtual addresses on the tested
+ * hardware always do, because the GPU address space is smaller than
+ * 2^48.
+ *
+ * Register indexes that belong to the application are in the range
+ * [user_register_base, work_registers). The function does not
+ * enforce that range, because it does not have access to the device
+ * structure. Callers should use the value from the interface struct
+ * and stay within the top four registers.
+ */
+void manvil_cmd_move48(manvil_cmd cmd, uint8_t dest_reg, uint64_t value);
+
+/*
+ * Load a 32-bit immediate into a CS register.
+ *
+ * Same addressing rules as manvil_cmd_move48.
+ */
+void manvil_cmd_move32(manvil_cmd cmd, uint8_t dest_reg, uint32_t value);
+
+/*
  * Signal a 64-bit sync object by adding a value to it.
  *
- * The sync object is a 64-bit counter in GPU memory. Adding value
- * raises it by value, which is the mechanism used to signal fences
- * and timeline semaphores.
+ * The address of the sync object and the value to add are not
+ * encoded in the command. Instead, the command carries the index of
+ * the CS register that holds each one. The caller must have loaded
+ * the address into address_reg (as a 64-bit value spanning
+ * address_reg and address_reg + 1) and the value into data_reg (as
+ * a 64-bit value spanning data_reg and data_reg + 1) before issuing
+ * this command.
  *
- * data              value to add to the sync object.
- * address           GPU virtual address of the object, in bytes.
+ * address_reg       index of the register holding the address.
+ * data_reg          index of the register holding the value.
  * scope             MANVIL_CS_SYNC_SCOPE_SYSTEM or _CSG.
  * wait_mask         16 bit scoreboard mask to defer on.
- * signal_slot       scoreboard entry that receives the operation completion.
+ * signal_slot       scoreboard entry that receives the completion.
  * defer_mode        MANVIL_CS_DEFER_*
  * error_propagate   if true, propagate the error state of the sync
  *                   object into the queue error state.
  */
 void manvil_cmd_sync_add64(manvil_cmd cmd,
-                            uint64_t data,
-                            uint64_t address,
+                            uint8_t  address_reg,
+                            uint8_t  data_reg,
                             uint8_t  scope,
                             uint16_t wait_mask,
                             uint8_t  signal_slot,
@@ -311,11 +343,11 @@ void manvil_cmd_sync_add64(manvil_cmd cmd,
  *
  * Same as SYNC_ADD64 but assigns the value directly instead of
  * adding to the current value. Used to reset a timeline to a known
- * value.
+ * value. The register conventions are the same as above.
  */
 void manvil_cmd_sync_set64(manvil_cmd cmd,
-                            uint64_t data,
-                            uint64_t address,
+                            uint8_t  address_reg,
+                            uint8_t  data_reg,
                             uint8_t  scope,
                             uint16_t wait_mask,
                             uint8_t  signal_slot,

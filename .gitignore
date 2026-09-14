@@ -44,3 +44,4 @@ src/regs/regs_generated_*.h
 # Test outputs
 tests/output/
 *.log
+logs/

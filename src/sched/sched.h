@@ -109,11 +109,51 @@ struct manvil_submit_desc {
      * A signal value of zero clears the sync. Signal values are
      * usually monotonically increasing across submissions of the
      * same queue.
+     *
+     * Each signal is compiled to a short sequence of CSF commands
+     * that write the sync through two CS registers. The two indexes
+     * below select which registers are used. They must come from
+     * the device interface struct (manvil_csf_iface.user_register_base)
+     * and must not collide with registers used by any other signal
+     * or by the wait sequence in the same submission.
+     *
+     * If num_signals is zero, these fields are ignored.
      */
     manvil_sync *const *signal_syncs;
     const uint64_t     *signal_values;
     size_t              num_signals;
+    uint8_t             signal_addr_reg;
+    uint8_t             signal_data_reg;
 };
+
+/*
+ * Submit a batch that only signals a sync object.
+ *
+ * Convenience wrapper for a submission with no waits and no caller
+ * commands. The scheduler emits the full CSF sequence that the
+ * firmware needs to set a sync object value after all previously
+ * submitted work on the queue has completed:
+ *
+ *   1. WAIT on all scoreboards (drains in flight work)
+ *   2. MOVE48 to load the sync address into a user register
+ *   3. MOVE48 to load the target value into a user register
+ *   4. SYNC_SET64 that writes the value through the two registers
+ *   5. ERROR_BARRIER
+ *
+ * The user registers used are taken from the device interface
+ * struct, which reads them from the firmware at open time. No
+ * register index is hardcoded.
+ *
+ * The submission is asynchronous. Call manvil_sync_wait_cpu or poll
+ * manvil_sync_value to observe the signal.
+ *
+ * Returns 0 on success, -1 on failure with errno set.
+ */
+int manvil_sched_signal_sync(manvil_queue *queue,
+                              manvil_sync *sync,
+                              uint64_t value,
+                              uint8_t address_reg,
+                              uint8_t data_reg);
 
 /*
  * Submit a batch described by manvil_submit_desc to a single queue.

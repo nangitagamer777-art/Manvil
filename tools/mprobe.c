@@ -485,11 +485,28 @@ static int step_submit(struct mprobe_state *st)
     manvil_sync *signals[1] = { st->sync };
     uint64_t      signal_values[1] = { 1 };
 
-    desc.cmds          = (const manvil_cmd *)cmds;
-    desc.num_cmds      = 1;
-    desc.signal_syncs  = signals;
-    desc.signal_values = signal_values;
-    desc.num_signals   = 1;
+    /*
+     * Use the top four registers of the CS register file for the
+     * signal. The base is reported by the firmware at open time and
+     * stored in the device interface struct. The first two
+     * registers hold the 64 bit address of the sync object, the
+     * next two hold the 64 bit value to write.
+     */
+    const struct manvil_csf_iface *csf = manvil_device_csf_iface(st->dev);
+    uint8_t addr_reg = 0;
+    uint8_t data_reg = 0;
+    if (csf != NULL) {
+        addr_reg = (uint8_t)(csf->user_register_base + 0);
+        data_reg = (uint8_t)(csf->user_register_base + 2);
+    }
+
+    desc.cmds             = (const manvil_cmd *)cmds;
+    desc.num_cmds         = 1;
+    desc.signal_syncs     = signals;
+    desc.signal_values    = signal_values;
+    desc.num_signals      = 1;
+    desc.signal_addr_reg  = addr_reg;
+    desc.signal_data_reg  = data_reg;
 
     int rc = manvil_sched_submit(st->queue, &desc);
     if (rc < 0) {
@@ -577,11 +594,21 @@ static int step_verify_second_submit(struct mprobe_state *st)
     manvil_sync *signals[1] = { st->sync };
     uint64_t      signal_values[1] = { 2 };
 
-    desc.cmds          = (const manvil_cmd *)cmds;
-    desc.num_cmds      = 1;
-    desc.signal_syncs  = signals;
-    desc.signal_values = signal_values;
-    desc.num_signals   = 1;
+    const struct manvil_csf_iface *csf = manvil_device_csf_iface(st->dev);
+    uint8_t addr_reg = 0;
+    uint8_t data_reg = 0;
+    if (csf != NULL) {
+        addr_reg = (uint8_t)(csf->user_register_base + 0);
+        data_reg = (uint8_t)(csf->user_register_base + 2);
+    }
+
+    desc.cmds             = (const manvil_cmd *)cmds;
+    desc.num_cmds         = 1;
+    desc.signal_syncs     = signals;
+    desc.signal_values    = signal_values;
+    desc.num_signals      = 1;
+    desc.signal_addr_reg  = addr_reg;
+    desc.signal_data_reg  = data_reg;
 
     int rc = manvil_sched_submit(st->queue, &desc);
     if (rc < 0) {

@@ -23,7 +23,12 @@
  */
 static size_t desc_total_entries(const struct manvil_submit_desc *desc)
 {
-    return desc->num_waits + desc->num_cmds + desc->num_signals;
+    /*
+     * Each wait is one command entry. Each caller command is one
+     * entry. Each signal is expanded into three entries: two MOVE48
+     * loads and one SYNC_SET64.
+     */
+    return desc->num_waits + desc->num_cmds + (3u * desc->num_signals);
 }
 
 /*
@@ -156,20 +161,22 @@ static void build_wait_cmd(manvil_cmd cmd,
  * propagation.
  */
 static void build_signal_cmd(manvil_cmd cmd,
-                              uint64_t sync_va,
-                              uint64_t value)
+                              uint8_t  address_reg,
+                              uint8_t  data_reg)
 {
     /*
-     * The command uses SYNC_SET64 semantics. That opcode was not
-     * wrapped as a builder function in cmd.h because the low level
-     * layout is the same as SYNC_ADD64 with the operation chosen by
-     * the opcode. Manvil's cmd module currently only exposes
-     * manvil_cmd_sync_add64 and manvil_cmd_sync_set64 as separate
-     * functions.
+     * The command reads the address and the value from two CS
+     * registers. The caller must have loaded those registers with
+     * MOVE48 before issuing this command.
+     *
+     * System scope is used so the signal is visible outside the CSG.
+     * No wait mask, signal slot 0, defer immediate, no error
+     * propagation. Higher layers that need different semantics
+     * construct the command themselves.
      */
     manvil_cmd_sync_set64(cmd,
-                           value,
-                           sync_va,
+                           address_reg,
+                           data_reg,
                            MANVIL_CS_SYNC_SCOPE_SYSTEM,
                            0,              /* wait_mask */
                            0,              /* signal_slot */
@@ -220,12 +227,31 @@ static int write_desc(manvil_queue *queue,
 
     /*
      * Signals last.
+     *
+     * Each signal is expanded into a short sequence of CSF commands:
+     *
+     *   1. MOVE48 loads the sync address into the address register.
+     *   2. MOVE48 loads the target value into the data register.
+     *   3. SYNC_SET64 writes the value through the two registers.
+     *
+     * The firmware executes commands within a single stream in
+     * order, so no explicit wait is needed between the moves and
+     * the sync.
      */
     for (size_t i = 0; i < desc->num_signals; i++) {
-        build_signal_cmd(scratch,
-                          manvil_sync_gpu_va(desc->signal_syncs[i]),
-                          desc->signal_values[i]);
-        if (manvil_queue_write(queue, scratch, MANVIL_CMD_SIZE_BYTES) < 0) {
+        manvil_cmd cmds[3];
+
+        uint64_t sync_va = manvil_sync_gpu_va(desc->signal_syncs[i]);
+        uint64_t value   = desc->signal_values[i];
+
+        manvil_cmd_move48(cmds[0], desc->signal_addr_reg, sync_va);
+        manvil_cmd_move48(cmds[1], desc->signal_data_reg, value);
+        build_signal_cmd(cmds[2],
+                          desc->signal_addr_reg,
+                          desc->signal_data_reg);
+
+        size_t bytes = 3u * MANVIL_CMD_SIZE_BYTES;
+        if (manvil_queue_write(queue, cmds, bytes) < 0) {
             return -1;
         }
     }
@@ -345,6 +371,50 @@ int manvil_sched_submit_many(const struct manvil_submit_many_desc *desc)
         if (manvil_queue_kick(desc->queues[i]) < 0) {
             return -1;
         }
+    }
+
+    return 0;
+}
+
+
+int manvil_sched_signal_sync(manvil_queue *queue,
+                              manvil_sync *sync,
+                              uint64_t value,
+                              uint8_t address_reg,
+                              uint8_t data_reg)
+{
+    if (queue == NULL || !manvil_queue_is_valid(queue)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (sync == NULL || !manvil_sync_is_valid(sync)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /*
+     * Emit a batch that consists of the two MOVE48 commands and the
+     * SYNC_SET64 command. The batch has no caller commands, so the
+     * sync value is set immediately after any previously submitted
+     * work on the queue has retired at the firmware level. The
+     * firmware processes the stream in order.
+     */
+    manvil_cmd cmds[3];
+
+    uint64_t sync_va = manvil_sync_gpu_va(sync);
+
+    manvil_cmd_move48(cmds[0], address_reg, sync_va);
+    manvil_cmd_move48(cmds[1], data_reg, value);
+    build_signal_cmd(cmds[2], address_reg, data_reg);
+
+    size_t bytes = 3u * MANVIL_CMD_SIZE_BYTES;
+    if (manvil_queue_write(queue, cmds, bytes) < 0) {
+        return -1;
+    }
+
+    if (manvil_queue_kick(queue) < 0) {
+        return -1;
     }
 
     return 0;

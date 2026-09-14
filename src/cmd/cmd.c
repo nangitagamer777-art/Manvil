@@ -99,6 +99,44 @@ void manvil_cmd_enop(manvil_cmd cmd, uint64_t driver_metadata)
     cmd_set_opcode(cmd, MANVIL_CS_OPCODE_ENOP);
 }
 
+void manvil_cmd_move48(manvil_cmd cmd, uint8_t dest_reg, uint64_t value)
+{
+    cmd_zero(cmd);
+
+    /*
+     * Immediate: bits 0-47 (48 bits).
+     *
+     * The value is truncated to 48 bits. GPU virtual addresses on the
+     * tested hardware fit, but callers should check before using
+     * this function with larger values.
+     */
+    cmd_write_field(cmd, 0u, 48u, value & 0xFFFFFFFFFFFFull);
+
+    /*
+     * Destination: bits 48-55 (8 bits).
+     */
+    cmd_write_field(cmd, 48u, 8u, dest_reg);
+
+    cmd_set_opcode(cmd, MANVIL_CS_OPCODE_MOVE48);
+}
+
+void manvil_cmd_move32(manvil_cmd cmd, uint8_t dest_reg, uint32_t value)
+{
+    cmd_zero(cmd);
+
+    /*
+     * Immediate: bits 0-31 (32 bits).
+     */
+    cmd_write_field(cmd, 0u, 32u, value);
+
+    /*
+     * Destination: bits 48-55 (8 bits).
+     */
+    cmd_write_field(cmd, 48u, 8u, dest_reg);
+
+    cmd_set_opcode(cmd, MANVIL_CS_OPCODE_MOVE32);
+}
+
 void manvil_cmd_wait(manvil_cmd cmd, uint16_t wait_mask, uint8_t wait_mode)
 {
     cmd_zero(cmd);
@@ -262,8 +300,8 @@ void manvil_cmd_heap_operation(manvil_cmd cmd,
 }
 
 void manvil_cmd_sync_add64(manvil_cmd cmd,
-                            uint64_t data,
-                            uint64_t address,
+                            uint8_t  address_reg,
+                            uint8_t  data_reg,
                             uint8_t  scope,
                             uint16_t wait_mask,
                             uint8_t  signal_slot,
@@ -288,21 +326,16 @@ void manvil_cmd_sync_add64(manvil_cmd cmd,
     cmd_write_field(cmd, 16u, 16u, wait_mask);
 
     /*
-     * Data: bits 32-39 (8 bits).
-     *
-     * The data field is 8 bits wide. For the 64 bit variants the
-     * field encodes the low bits of the value to add or set. The
-     * firmware combines this with the sync object's existing value.
-     *
-     * Higher layers should place the full value in the sync object
-     * they allocate and use small data increments here.
+     * Data: bits 32-39 (8 bits). Index of the register that holds
+     * the value to add.
      */
-    cmd_write_field(cmd, 32u, 8u, data & 0xffu);
+    cmd_write_field(cmd, 32u, 8u, data_reg);
 
     /*
-     * Address: bits 40-47 (8 bits, in units of 256 bytes).
+     * Address: bits 40-47 (8 bits). Index of the register that
+     * holds the address of the sync object.
      */
-    cmd_write_field(cmd, 40u, 8u, (address >> 8) & 0xffu);
+    cmd_write_field(cmd, 40u, 8u, address_reg);
 
     /*
      * Signal slot: bits 48-51.
@@ -318,8 +351,8 @@ void manvil_cmd_sync_add64(manvil_cmd cmd,
 }
 
 void manvil_cmd_sync_set64(manvil_cmd cmd,
-                            uint64_t data,
-                            uint64_t address,
+                            uint8_t  address_reg,
+                            uint8_t  data_reg,
                             uint8_t  scope,
                             uint16_t wait_mask,
                             uint8_t  signal_slot,
@@ -331,8 +364,8 @@ void manvil_cmd_sync_set64(manvil_cmd cmd,
     cmd_set_bit(cmd, 0u, error_propagate);
     cmd_write_field(cmd, 1u, 2u, scope);
     cmd_write_field(cmd, 16u, 16u, wait_mask);
-    cmd_write_field(cmd, 32u, 8u, data & 0xffu);
-    cmd_write_field(cmd, 40u, 8u, (address >> 8) & 0xffu);
+    cmd_write_field(cmd, 32u, 8u, data_reg);
+    cmd_write_field(cmd, 40u, 8u, address_reg);
     cmd_write_field(cmd, 48u, 4u, signal_slot);
     cmd_set_bit(cmd, 52u, defer_mode == MANVIL_CS_DEFER_INDIRECT);
 
