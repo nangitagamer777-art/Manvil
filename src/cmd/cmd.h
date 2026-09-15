@@ -210,23 +210,24 @@ void manvil_cmd_req_resource(manvil_cmd cmd,
  * Call a subroutine at the given address.
  *
  * The CALL command transfers control to a stream of commands stored
- * elsewhere in GPU memory, executes them, and returns. The length
- * field describes how many instruction words the called block
- * contains, which lets the firmware prefetch the block.
+ * elsewhere in GPU memory, executes them, and returns. The address
+ * and the length are not encoded in the command itself: the command
+ * carries the index of the CS registers that hold each one. The
+ * caller must load the address into address_reg (as a 64-bit value
+ * spanning address_reg and address_reg + 1) and the length into
+ * length_reg (as a 32-bit value).
  *
- * address     GPU virtual address of the target block, in bytes.
- *             The low 4 bits are ignored because the command stream
- *             is aligned to 16 bytes.
- * length      Number of 16-byte entries in the target block, encoded
- *             in the low 8 bits of the length field.
+ * address_reg   index of the register holding the target address.
+ * length_reg    index of the register holding the number of 16-byte
+ *               entries in the target block.
  */
-void manvil_cmd_call(manvil_cmd cmd, uint64_t address, uint8_t length);
+void manvil_cmd_call(manvil_cmd cmd, uint8_t address_reg, uint8_t length_reg);
 
 /*
  * Jump to a subroutine at the given address without saving a return
- * address. Same field layout as CALL.
+ * address. Same field layout and register conventions as CALL.
  */
-void manvil_cmd_jump(manvil_cmd cmd, uint64_t address, uint8_t length);
+void manvil_cmd_jump(manvil_cmd cmd, uint8_t address_reg, uint8_t length_reg);
 
 /*
  * Flush caches and wait for a specific latest flush identifier.

@@ -172,32 +172,31 @@ void manvil_cmd_req_resource(manvil_cmd cmd,
     cmd_set_opcode(cmd, MANVIL_CS_OPCODE_REQ_RESOURCE);
 }
 
-void manvil_cmd_call(manvil_cmd cmd, uint64_t address, uint8_t length)
+void manvil_cmd_call(manvil_cmd cmd, uint8_t address_reg, uint8_t length_reg)
 {
     cmd_zero(cmd);
 
     /*
-     * Length: bits 32-39 (8 bits).
+     * Length: bits 32-39 (8 bits). Index of the register that holds
+     * the number of 16-byte entries in the called block.
      */
-    cmd_write_field(cmd, 32u, 8u, length);
+    cmd_write_field(cmd, 32u, 8u, length_reg);
 
     /*
-     * Address: bits 40-47 (8 bits). The address field is only 8 bits
-     * wide in the specification, which means the target address is
-     * encoded in units of 256 bytes (the low byte of the address is
-     * dropped). This matches the format expected by the firmware.
+     * Address: bits 40-47 (8 bits). Index of the register that holds
+     * the target address.
      */
-    cmd_write_field(cmd, 40u, 8u, (address >> 8) & 0xffu);
+    cmd_write_field(cmd, 40u, 8u, address_reg);
 
     cmd_set_opcode(cmd, MANVIL_CS_OPCODE_CALL);
 }
 
-void manvil_cmd_jump(manvil_cmd cmd, uint64_t address, uint8_t length)
+void manvil_cmd_jump(manvil_cmd cmd, uint8_t address_reg, uint8_t length_reg)
 {
     cmd_zero(cmd);
 
-    cmd_write_field(cmd, 32u, 8u, length);
-    cmd_write_field(cmd, 40u, 8u, (address >> 8) & 0xffu);
+    cmd_write_field(cmd, 32u, 8u, length_reg);
+    cmd_write_field(cmd, 40u, 8u, address_reg);
 
     cmd_set_opcode(cmd, MANVIL_CS_OPCODE_JUMP);
 }

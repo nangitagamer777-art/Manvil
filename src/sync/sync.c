@@ -93,9 +93,20 @@ manvil_sync *manvil_sync_create(manvil_kbase *kbase, bool cross_group)
                      MANVIL_MEM_GPU_READ |
                      MANVIL_MEM_GPU_WRITE |
                      MANVIL_MEM_SAME_VA;
-    if (cross_group) {
-        flags |= MANVIL_BASE_MEM_CSF_EVENT;
-    }
+
+    /*
+     * Always allocate sync objects with the CSF_EVENT flag.
+     *
+     * The CPU polls the value continuously while waiting, and the
+     * firmware writes it from the GPU. Without an uncached mapping
+     * the CPU can observe a stale value and the wait would loop
+     * until timeout even after the firmware has updated it.
+     *
+     * The flag also makes the object visible across command stream
+     * groups, which is required for cross-queue synchronization.
+     */
+    (void)cross_group;
+    flags |= MANVIL_BASE_MEM_CSF_EVENT;
 
     sync->mem = manvil_mem_alloc(kbase, MANVIL_SYNC_SIZE_BYTES, flags);
     if (sync->mem == NULL) {

@@ -136,6 +136,49 @@ static void step_fail(void)
 }
 
 /*
+ * Load the NOP test shader from disk into a heap buffer.
+ *
+ * Returns the size on success, 0 on failure. The caller owns the
+ * buffer and must free it.
+ */
+static size_t load_nop_shader(uint8_t **out_buf)
+{
+    *out_buf = NULL;
+
+    const char *filepath = "/root/Manvil/assets/shader_nop.bin";
+    FILE *f = fopen(filepath, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0 || size > 4096) {
+        fclose(f);
+        return 0;
+    }
+
+    uint8_t *buf = malloc((size_t)size);
+    if (buf == NULL) {
+        fclose(f);
+        return 0;
+    }
+
+    size_t rd = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+
+    if (rd != (size_t)size) {
+        free(buf);
+        return 0;
+    }
+
+    *out_buf = buf;
+    return (size_t)size;
+}
+
+/*
  * Drain any pending CSF notifications and print a summary line for
  * each one. Returns the number of notifications consumed.
  *
@@ -639,6 +682,126 @@ static int step_heap_submit(struct mprobe_state *st)
 }
 
 /*
+ * Step 8: run the NOP shader via CALL.
+ *
+ * This is the first execution of real ISA Valhall code. The
+ * sequence is:
+ *
+ *   1. allocate GPU memory for the shader
+ *   2. copy the 32-byte NOP shader into it
+ *   3. flush the CPU cache so the GPU sees the data
+ *   4. submit a batch that emits MOVE48 + MOVE32 + CALL, followed
+ *      by the sync signal
+ *
+ * The shader itself does nothing except exercise the control
+ * transfer: the firmware jumps to the shader address, executes
+ * four NOPs, and the last one carries flow=end which returns
+ * control to the ring.
+ */
+static int step_shader_nop(struct mprobe_state *st)
+{
+    step_header(8, "Running NOP shader via CALL");
+
+    uint8_t *shader_data = NULL;
+    size_t shader_size = load_nop_shader(&shader_data);
+    if (shader_size == 0) {
+        step_fail();
+        indent_printf("cannot load shader from "
+                      "/root/Manvil/assets/shader_nop.bin");
+        return -1;
+    }
+
+    /*
+     * Use coherent memory for the shader. The kernel on the tested
+     * device only accepts invalidate operations through MEM_SYNC,
+     * so we cannot force a clean of the CPU cache after writing the
+     * shader. Coherent memory avoids the need for a clean.
+     */
+    manvil_mem *shader_mem =
+        manvil_mem_alloc_coherent(manvil_device_kbase(st->dev), 4096);
+    if (shader_mem == NULL) {
+        step_fail();
+        indent_printf("shader mem alloc failed");
+        free(shader_data);
+        return -1;
+    }
+
+    void *cpu_ptr = manvil_mem_cpu_ptr(shader_mem);
+    memcpy(cpu_ptr, shader_data, shader_size);
+    free(shader_data);
+
+    /*
+     * No explicit sync needed: coherent memory is visible to the
+     * GPU without cache maintenance.
+     */
+
+    const struct manvil_csf_iface *csf = manvil_device_csf_iface(st->dev);
+    uint8_t reg_addr  = (uint8_t)(csf->user_register_base + 0);
+    uint8_t reg_value = (uint8_t)(csf->user_register_base + 2);
+    uint8_t reg_len   = (uint8_t)(csf->user_register_base + 3);
+
+    manvil_cmd cmds[3];
+
+    manvil_cmd_move48(cmds[0], reg_addr,
+                       manvil_mem_gpu_va(shader_mem));
+    manvil_cmd_move32(cmds[1], reg_len, (uint32_t)shader_size);
+    manvil_cmd_call(cmds[2], reg_addr, reg_len);
+
+    /* Reset the sync so we observe the signal from this batch. */
+    void *sync_ptr = manvil_mem_cpu_ptr(manvil_sync_mem(st->sync));
+    *(volatile uint64_t *)sync_ptr = 0;
+
+    struct manvil_submit_desc desc;
+    memset(&desc, 0, sizeof(desc));
+
+    manvil_sync *signals[1] = { st->sync };
+    uint64_t      signal_values[1] = { 1 };
+
+    desc.cmds             = (const manvil_cmd *)cmds;
+    desc.num_cmds         = 3;
+    desc.signal_syncs     = signals;
+    desc.signal_values    = signal_values;
+    desc.num_signals      = 1;
+    desc.signal_addr_reg  = reg_addr;
+    desc.signal_data_reg  = reg_value;
+
+    int rc = manvil_sched_submit(st->queue, &desc);
+    if (rc < 0) {
+        step_fail();
+        indent_printf("manvil_sched_submit: %s", strerror(errno));
+        manvil_mem_free(shader_mem);
+        return -1;
+    }
+
+    rc = manvil_sync_wait_cpu(st->sync, 1, g_cfg.wait_timeout_ns);
+    if (rc < 0) {
+        step_fail();
+        indent_printf("sync wait error: %s", strerror(errno));
+        manvil_mem_free(shader_mem);
+        return -1;
+    }
+    if (rc > 0) {
+        step_fail();
+        indent_printf("timeout waiting for shader execution");
+        drain_notifications(st->dev);
+        manvil_mem_free(shader_mem);
+        return -1;
+    }
+
+    step_ok();
+
+    indent_printf_hex64("Shader GPU VA:", manvil_mem_gpu_va(shader_mem));
+    indent_printf("Shader size:        %zu bytes", shader_size);
+    indent_printf("Sync value:         %" PRIu64,
+                  manvil_sync_value(st->sync));
+
+    drain_notifications(st->dev);
+
+    manvil_mem_free(shader_mem);
+    return 0;
+}
+
+/*
  * Step 6: submit a two command batch through the scheduler, with
  * the sync set at the end.
  *
@@ -647,7 +810,7 @@ static int step_heap_submit(struct mprobe_state *st)
  */
 static int step_submit(struct mprobe_state *st)
 {
-    step_header(8, "Submitting ENOP + signal");
+    step_header(9, "Submitting ENOP + signal");
 
     manvil_cmd cmds[1];
     manvil_cmd_enop(cmds[0], 0xABC123);
@@ -711,7 +874,7 @@ static int step_submit(struct mprobe_state *st)
  */
 static int step_wait_sync(struct mprobe_state *st)
 {
-    step_header(9, "Waiting for sync to reach value 2");
+    step_header(10, "Waiting for sync to reach value 2");
 
     int64_t started = now_ns();
     int rc = manvil_sync_wait_cpu(st->sync, 2, g_cfg.wait_timeout_ns);
@@ -756,7 +919,7 @@ static int step_wait_sync(struct mprobe_state *st)
  */
 static int step_verify_second_submit(struct mprobe_state *st)
 {
-    step_header(10, "Second submit, sync target 3");
+    step_header(11, "Second submit, sync target 3");
 
     manvil_cmd cmds[1];
     manvil_cmd_enop(cmds[0], 0xDEF456);
@@ -823,7 +986,7 @@ static int step_verify_second_submit(struct mprobe_state *st)
  */
 static int step_check_idle(struct mprobe_state *st)
 {
-    step_header(11, "Checking queue idle");
+    step_header(12, "Checking queue idle");
 
     if (!manvil_queue_is_idle(st->queue)) {
         step_fail();
@@ -851,7 +1014,7 @@ static int step_check_idle(struct mprobe_state *st)
  */
 static int step_cleanup(struct mprobe_state *st)
 {
-    step_header(12, "Cleanup");
+    step_header(13, "Cleanup");
 
     cleanup_state(st);
     step_ok();
@@ -894,11 +1057,12 @@ int main(int argc, char **argv)
     if (step_create_sync(&st) < 0) { result = 5; goto done; }
     if (step_heap_create(&st) < 0) { result = 6; goto done; }
     if (step_heap_submit(&st) < 0) { result = 7; goto done; }
-    if (step_submit(&st) < 0) { result = 8; goto done; }
-    if (step_wait_sync(&st) < 0) { result = 9; goto done; }
-    if (step_verify_second_submit(&st) < 0) { result = 10; goto done; }
-    if (step_check_idle(&st) < 0) { result = 11; goto done; }
-    if (step_cleanup(&st) < 0) { result = 12; goto done; }
+    if (step_shader_nop(&st) < 0) { result = 8; goto done; }
+    if (step_submit(&st) < 0) { result = 9; goto done; }
+    if (step_wait_sync(&st) < 0) { result = 10; goto done; }
+    if (step_verify_second_submit(&st) < 0) { result = 11; goto done; }
+    if (step_check_idle(&st) < 0) { result = 12; goto done; }
+    if (step_cleanup(&st) < 0) { result = 13; goto done; }
 
 done:
     /*

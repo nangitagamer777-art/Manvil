@@ -120,6 +120,15 @@ manvil_mem *manvil_mem_alloc_ro(manvil_kbase *kbase, uint64_t size_bytes);
 manvil_mem *manvil_mem_alloc_exec(manvil_kbase *kbase, uint64_t size_bytes);
 
 /*
+ * Allocate read-write GPU memory with system-wide coherence.
+ * Preferred for small allocations written from the CPU and read by
+ * the GPU, because the kernel does not allow forcing a clean of the
+ * CPU cache through MEM_SYNC.
+ */
+manvil_mem *manvil_mem_alloc_coherent(manvil_kbase *kbase,
+                                       uint64_t size_bytes);
+
+/*
  * Free a GPU memory allocation.
  *
  * Passing NULL is a no-op.

@@ -231,6 +231,32 @@ manvil_mem *manvil_mem_alloc_rw(manvil_kbase *kbase, uint64_t size_bytes)
     return manvil_mem_alloc(kbase, size_bytes, MANVIL_MEM_FLAGS_RW);
 }
 
+/*
+ * Allocate read-write GPU memory with system-wide coherence.
+ *
+ * On platforms where the CPU and the GPU share a coherent view of
+ * memory (most modern Mali GPUs), this allows the CPU to write data
+ * that the GPU reads without an explicit cache flush. The kernel
+ * silently drops the coherent flag if the platform does not support
+ * it, in which case the caller must still perform an explicit sync.
+ *
+ * Use this for small allocations like shader code or command
+ * descriptors that are written from the CPU and read by the GPU
+ * shortly afterwards.
+ */
+manvil_mem *manvil_mem_alloc_coherent(manvil_kbase *kbase,
+                                       uint64_t size_bytes)
+{
+    uint32_t flags = MANVIL_MEM_CPU_READ |
+                     MANVIL_MEM_CPU_WRITE |
+                     MANVIL_MEM_GPU_READ |
+                     MANVIL_MEM_GPU_WRITE |
+                     MANVIL_MEM_SAME_VA |
+                     MANVIL_BASE_MEM_COHERENT_SYSTEM |
+                     MANVIL_BASE_MEM_COHERENT_SYSTEM_REQUIRED;
+    return manvil_mem_alloc(kbase, size_bytes, flags);
+}
+
 manvil_mem *manvil_mem_alloc_ro(manvil_kbase *kbase, uint64_t size_bytes)
 {
     return manvil_mem_alloc(kbase, size_bytes, MANVIL_MEM_FLAGS_RO);
@@ -286,13 +312,49 @@ int manvil_mem_sync(manvil_mem *mem, manvil_mem_sync_dir dir)
     struct manvil_kbase_ioctl_mem_sync sync_args;
     memset(&sync_args, 0, sizeof(sync_args));
 
-    sync_args.handle    = mem->gpu_va;
+    /*
+     * Empirical result on the tested MediaTek Mali-G615: the kernel
+     * accepts only a small set of parameter combinations for
+     * MEM_SYNC.
+     *
+     *   handle = CPU VA of the mapping
+     *   user_addr = anything (the kernel does not strictly check it)
+     *   type = 1 (invalidate / FROM_DEVICE)
+     *
+     * Anything else returns EINVAL. In particular:
+     *
+     *   - passing the cookie as the handle fails
+     *   - passing type=0 (clean / TO_DEVICE) always fails
+     *
+     * The type=1 restriction means we cannot force a clean of the
+     * CPU cache to make CPU writes visible to the GPU. Callers that
+     * need that property must allocate coherent memory instead (see
+     * manvil_mem_alloc_coherent).
+     *
+     * The dir argument is kept for API symmetry but the kernel
+     * rejects TO_DEVICE, so this function only issues invalidate
+     * operations. Callers that need a clean are expected to use
+     * coherent memory.
+     */
+    (void)dir;
+    sync_args.handle    = (uint64_t)(uintptr_t)mem->cpu_ptr;
     sync_args.user_addr = (uint64_t)(uintptr_t)mem->cpu_ptr;
     sync_args.size      = mem->size_bytes;
-    sync_args.type      = (uint8_t)dir;
+    sync_args.type      = 1;  /* invalidate */
+
+    fprintf(stderr,
+            "[manvil] MEM_SYNC: handle=0x%llx user_addr=0x%llx size=%llu type=%u\n",
+            (unsigned long long)sync_args.handle,
+            (unsigned long long)sync_args.user_addr,
+            (unsigned long long)sync_args.size,
+            sync_args.type);
 
     int rc = manvil_kbase_ioctl(mem->kbase, MANVIL_KBASE_IOCTL_MEM_SYNC,
                                 &sync_args, "MEM_SYNC");
+    if (rc < 0) {
+        fprintf(stderr, "[manvil] MEM_SYNC failed: errno=%d (%s)\n",
+                errno, strerror(errno));
+    }
     return rc < 0 ? -1 : 0;
 }
 
