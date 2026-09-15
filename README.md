@@ -1,5 +1,6 @@
 # Manvil
 
+Experimental project not completed, may not continue
 A native Vulkan driver for Arm Mali Valhall GPUs running on the proprietary
 Kbase kernel driver.
 
